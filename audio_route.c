@@ -444,7 +444,8 @@ done:
     state->level++;
 }
 
-static void end_tag(void *data, const XML_Char *tag_name)
+static void end_tag(void *data, const XML_Char *tag_name
+		    __attribute__((unused)))
 {
     struct config_parse_state *state = data;
 
