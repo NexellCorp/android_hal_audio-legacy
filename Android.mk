@@ -34,7 +34,8 @@ LOCAL_SHARED_LIBRARIES := \
 	libaudioutils \
 	libexpat \
 	libnxvoice \
-	libpvo
+	libpvo \
+	libpovosource
 LOCAL_C_INCLUDES += \
 	external/tinyalsa/include \
 	external/expat/lib \
