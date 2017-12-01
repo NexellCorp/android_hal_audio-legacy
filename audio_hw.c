@@ -23,6 +23,7 @@
 #include <stdlib.h>
 #include <sys/time.h>
 #include <fcntl.h>
+#include <pthread.h>
 
 #include <cutils/log.h>
 #include <cutils/properties.h>
@@ -34,6 +35,8 @@
 
 #include <audio_utils/resampler.h>
 #include <tinyalsa/asoundlib.h>
+#include <nx-smartvoice.h>
+#include <pvpre.h>
 #include "audio_route.h"
 
 #if	(0)
@@ -61,6 +64,22 @@
 #define MAX_SUPPORTED_CHANNEL_MASKS 2
 
 #define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
+
+#define NXAUDIO_INPUT_BUFFER_SIZE		(256 * 1 * 2 * 4)
+
+static const char *USE_NXVOICE_PROP_KEY = "persist.nv.use_nxvoice";
+static const char *VOICE_VENDOR_PROP_KEY = "persist.nv.voice_vendor";
+static const char *USE_FEEDBACK_PROP_KEY = "persist.nv.use_feedback";
+static const char *PDM_DEVNUM_PROP_KEY = "persist.nv.pdm_devnum";
+static const char *REF_DEVNUM_PROP_KEY = "persist.nv.ref_devnum";
+static const char *FEEDBACK_DEVNUM_PROP_KEY = "persist.nv.feedback_devnum";
+static const char *PDM_CHNUM_PROP_KEY = "persist.nv.pdm_chnum";
+static const char *PDM_GAIN_PROP_KEY = "persist.nv.pdm_gain";
+static const char *RESAMPLE_OUT_CHNUM_PROP_KEY = "persist.nv.resample_out_chnum";
+static const char *CHECK_TRIGGER_PROP_KEY = "persist.nv.check_trigger";
+static const char *TRIGGER_DONE_RET_VALUE_PROP_KEY = "persist.nv.trigger_done_ret";
+static const char *PASS_AFTER_TRIGGER_PROP_KEY = "persist.nv.pass_after_trigger";
+static const char *NXVOICE_VERBOSE_PROP_KEY = "persist.nv.nxvoice_verbose";
 
 enum output_type {
 	OUTPUT_DEEP_BUF,      // deep PCM buffers output stream
@@ -133,6 +152,10 @@ struct audio_device {
 						   * and output device IDs */
 	audio_channel_mask_t in_channel_mask;
 	struct stream_out *outputs[OUTPUT_TOTAL];
+
+	bool use_nxvoice;
+	struct nx_smartvoice_config nxvoice_config;
+	void *nxvoice_handle;
 };
 
 struct stream_out {
@@ -187,6 +210,18 @@ struct stream_in {
 	FILE *file;
 	/* sound card */
 	struct snd_card_dev *card;
+};
+
+struct nxvoice_stream_in {
+	struct audio_stream_in stream;
+	struct audio_device *dev;
+	bool standby;
+	audio_source_t input_source;
+	audio_io_handle_t io_handle;
+	audio_devices_t device;
+	uint32_t sample_rate;
+	audio_format_t format;
+	audio_channel_mask_t channel_mask;
 };
 
 static int stream_in_refcount = 0; //  add refcount for CTS testRecordingAudioInRawFormats
@@ -540,7 +575,7 @@ static void select_devices(struct audio_device *adev)
 		}
 	}
 
-	ALOGV("select_devices() devices %#x input src %d output route %s input route %s",
+	DLOGI("select_devices() devices %#x input src %d output route %s input route %s",
 		  adev->out_device, adev->input_source,
 		  output_route ? output_route : "none",
 		  input_route ? input_route : "none");
@@ -1900,6 +1935,252 @@ static void adev_close_input_stream(struct audio_hw_device *dev __unused,
 	return;
 }
 
+/**
+ * nxvoice input stream callback implementation */
+static uint32_t nxvoice_in_get_sample_rate(const struct audio_stream *stream)
+{
+	struct nxvoice_stream_in *in = (struct nxvoice_stream_in *)stream;
+
+	DLOGI("%s: sample_rate=%d\n", __func__, in->sample_rate);
+	return in->sample_rate;
+}
+
+static int nxvoice_in_set_sample_rate(struct audio_stream *stream __unused,
+									  uint32_t rate __unused)
+{
+	DLOGI("%s (rate=%d)\n", __FUNCTION__, rate);
+	return 0;
+}
+
+static size_t
+nxvoice_in_get_buffer_size(const struct audio_stream *stream __unused)
+{
+	size_t buffer_size = NXAUDIO_INPUT_BUFFER_SIZE;
+
+	DLOGI("%s (buffer_size=%d)\n", __FUNCTION__, buffer_size);
+	return buffer_size;
+}
+
+static audio_channel_mask_t
+nxvoice_in_get_channels(const struct audio_stream *stream)
+{
+	struct nxvoice_stream_in *in = (struct nxvoice_stream_in *)stream;
+	audio_channel_mask_t channel_mask = in->channel_mask;
+
+	DLOGI("%s mask=0x%x\n", __FUNCTION__, channel_mask);
+	return channel_mask;
+}
+
+static audio_format_t nxvoice_in_get_format(const struct audio_stream *stream)
+{
+	struct nxvoice_stream_in *in = (struct nxvoice_stream_in *)stream;
+
+	DLOGI("%s (format=0x%x)\n", __FUNCTION__, in->format);
+	return in->format;
+}
+
+static int nxvoice_in_set_format(struct audio_stream *stream __unused,
+								 audio_format_t format __unused)
+{
+	DLOGI("%s (format=0x%x)\n", __FUNCTION__, format);
+	return -ENOSYS;
+}
+
+static int nxvoice_in_standby(struct audio_stream *stream)
+{
+	struct nxvoice_stream_in *in = (struct nxvoice_stream_in *)stream;
+	struct audio_device *adev = in->dev;
+
+	DLOGI("%s Enter", __func__);
+	in->dev->input_source = AUDIO_SOURCE_DEFAULT;
+	in->dev->in_device = AUDIO_DEVICE_NONE;
+	in->dev->in_channel_mask = 0;
+	DLOGI("%s Exit", __func__);
+	return 0;
+}
+
+static int
+nxvoice_in_set_parameters(struct audio_stream *stream, const char *kvpairs)
+{
+	struct nxvoice_stream_in *in = (struct nxvoice_stream_in *)stream;
+	struct audio_device *adev = in->dev;
+	struct str_parms *parms;
+	char value[32];
+	int ret;
+	unsigned int val;
+
+	parms = str_parms_create_str(kvpairs);
+
+	DLOGI("%s\n", __FUNCTION__);
+
+	ret = str_parms_get_str(parms, AUDIO_PARAMETER_STREAM_INPUT_SOURCE,
+							value, sizeof(value));
+	if (ret >= 0) {
+		val = atoi(value);
+		/* no audio source uses val == 0 */
+		if ((in->input_source != val) && (val != 0)) {
+			in->input_source = val;
+			DLOGI("%s: input_source %d", __func__, in->input_source);
+		}
+	}
+
+	ret = str_parms_get_str(parms, AUDIO_PARAMETER_STREAM_ROUTING,
+							value, sizeof(value));
+	if (ret >= 0) {
+		/* strip AUDIO_DEVICE_BIT_IN to allow bitwise comparisons */
+		val = atoi(value) & ~AUDIO_DEVICE_BIT_IN;
+		/* no audio device uses val == 0 */
+		if ((in->device != val) && (val != 0)) {
+			in->device = val;
+			DLOGI("%s: input device %d", __func__, in->device);
+		}
+	}
+
+	str_parms_destroy(parms);
+	return ret;
+}
+
+static int
+nxvoice_in_add_audio_effect(const struct audio_stream *stream __unused,
+							effect_handle_t effect __unused)
+{
+	DLOGI("%s\n", __FUNCTION__);
+	return 0;
+}
+
+static int
+nxvoice_in_remove_audio_effect(const struct audio_stream *stream __unused,
+							   effect_handle_t effect __unused)
+{
+	DLOGI("%s\n", __FUNCTION__);
+	return 0;
+}
+
+static ssize_t nxvoice_in_read(struct audio_stream_in *stream, void *buffer,
+							   size_t bytes)
+{
+	int ret = 0;
+	struct nxvoice_stream_in *in = (struct nxvoice_stream_in *)stream;
+	struct audio_device *adev = in->dev;
+	ssize_t frames = bytes / audio_stream_in_frame_size(&in->stream);
+
+	DLOGI("%s: bytes %d, frames %d", __func__, bytes, frames);
+
+	ret = nx_voice_get_data(adev->nxvoice_handle, (short *)buffer, frames);
+	if ((size_t)ret != bytes)
+		ALOGE("%s: failed to nx_voice_get_data(ret %d, bytes %d)",
+			  __func__, ret, bytes);
+
+	DLOGI("%s: return %d", __func__, bytes);
+	return bytes;
+}
+
+static int
+adev_nxvoice_open_input_stream(struct audio_hw_device *dev,
+							   audio_io_handle_t handle,
+							   audio_devices_t devices,
+							   struct audio_config *config,
+							   struct audio_stream_in **stream_in,
+							   audio_input_flags_t flags __unused,
+							   const char *address __unused,
+							   audio_source_t source __unused)
+{
+	struct audio_device *adev = (struct audio_device *)dev;
+	struct nxvoice_stream_in *in;
+	int ret;
+
+	*stream_in = NULL;
+
+	ALOGD("*** %s (devices=0x%x, request rate=%d, channel_mask=0x%x, frame_count=%d) ***",
+		  __func__, devices, config->sample_rate, config->channel_mask,
+		  config->frame_count);
+
+	/* Respond with a request for mono if a different format is given. */
+	if (config->channel_mask != AUDIO_CHANNEL_IN_MONO &&
+		config->channel_mask != AUDIO_CHANNEL_IN_FRONT_BACK) {
+		config->channel_mask  = AUDIO_CHANNEL_IN_MONO;
+		ALOGE("%s: channel must be mono\n", __func__);
+		return -EINVAL;
+	}
+
+	if (config->sample_rate != 16000) {
+		ALOGE("%s: sample_rate %d is not supported, support only 16000\n",
+			  __func__, config->sample_rate);
+		config->sample_rate = 16000;
+		return -EINVAL;
+	}
+
+	if (config->format != AUDIO_FORMAT_PCM_16_BIT) {
+		ALOGE("%s: format 0x%x is not supported, support only 16bit pcm\n",
+			  __func__, config->format);
+		config->format = AUDIO_FORMAT_PCM_16_BIT;
+		return -EINVAL;
+	}
+
+	in = (struct nxvoice_stream_in *)calloc(1, sizeof(*in));
+	if (!in) {
+		ALOGE("%s: failed to alloc nxvoice_stream_in", __func__);
+		return -ENOMEM;
+	}
+
+	in->dev = adev;
+
+	in->channel_mask = config->channel_mask;
+	in->sample_rate = config->sample_rate;
+	in->format = config->format;
+
+	in->stream.common.get_sample_rate = nxvoice_in_get_sample_rate;
+	in->stream.common.set_sample_rate = nxvoice_in_set_sample_rate;
+	in->stream.common.get_buffer_size = nxvoice_in_get_buffer_size;
+	in->stream.common.get_channels = nxvoice_in_get_channels;
+	in->stream.common.get_format = nxvoice_in_get_format;
+	in->stream.common.set_format = nxvoice_in_set_format;
+	in->stream.common.standby = nxvoice_in_standby;
+	in->stream.common.dump = in_dump;
+	in->stream.common.set_parameters = nxvoice_in_set_parameters;
+	in->stream.common.get_parameters = in_get_parameters;
+	in->stream.common.add_audio_effect = nxvoice_in_add_audio_effect;
+	in->stream.common.remove_audio_effect = nxvoice_in_remove_audio_effect;
+	in->stream.set_gain = in_set_gain;
+	in->stream.read = nxvoice_in_read;
+	in->stream.get_input_frames_lost = in_get_input_frames_lost;
+
+	in->standby = true;
+
+	in->input_source = AUDIO_SOURCE_DEFAULT;
+	/* strip AUDIO_DEVICE_BIT_IN to allow bitwise comparisons */
+	in->device = devices & ~AUDIO_DEVICE_BIT_IN;
+	in->io_handle = handle;
+
+	*stream_in = &in->stream;
+
+	return 0;
+}
+
+static void
+adev_nxvoice_close_input_stream(struct audio_hw_device *dev __unused,
+								struct audio_stream_in *stream)
+{
+	struct nxvoice_stream_in *in = (struct nxvoice_stream_in *)stream;
+
+	ALOGD("%s\n", __func__);
+
+	if (in != NULL)
+		free(in);
+
+	return;
+}
+
+static size_t
+adev_nxvoice_get_input_buffer_size(const struct audio_hw_device *dev __unused,
+								   const struct audio_config *config __unused)
+{
+	size_t buffer_size = NXAUDIO_INPUT_BUFFER_SIZE;
+
+	DLOGI("%s (buffer_size=%d)\n", __func__, buffer_size);
+	return buffer_size;
+}
+
 static int adev_dump(const audio_hw_device_t *device __unused,
 					 int fd __unused)
 {
@@ -1912,8 +2193,100 @@ static int adev_close(hw_device_t *device)
 
 	audio_route_free(adev->ar);
 
+	if (adev->use_nxvoice) {
+		nx_voice_stop(adev->nxvoice_handle);
+		nx_voice_close_handle(adev->nxvoice_handle);
+		adev->nxvoice_handle = NULL;
+	}
+
 	free(device);
 	return 0;
+}
+
+static bool nx_voice_prop_init(struct nx_smartvoice_config *c)
+{
+	int len;
+	char buf[PROPERTY_VALUE_MAX];
+	int val;
+
+	val = property_get_bool(USE_NXVOICE_PROP_KEY, 0);
+	if (val == 0) {
+		ALOGI("Do not use NXVoice");
+		return false;
+	}
+
+	ALOGI("Use NXVoice!!!");
+
+	len = property_get(VOICE_VENDOR_PROP_KEY, buf, "pvo");
+	if (len <= 0) {
+		ALOGE("%s: failed to property_get for %s\n", __func__,
+		      VOICE_VENDOR_PROP_KEY);
+		return false;
+	}
+	if (strncmp(buf, "pvo", 3) == 0) {
+		c->cb.init = PVPRE_Init;
+		c->cb.process = PVPRE_Process_4ch;
+		c->cb.post_process = PoVoGateSource;
+		c->cb.deinit = PVPRE_Close;
+	} else {
+		ALOGE("%s: vendor %s not supported\n", __func__, buf);
+		ALOGE("Currently only pvo is supported\n");
+		return false;
+	}
+
+	c->use_feedback = property_get_int32(USE_FEEDBACK_PROP_KEY, 0);
+	c->pdm_devnum = property_get_int32(PDM_DEVNUM_PROP_KEY, 2);
+	c->ref_devnum = property_get_int32(REF_DEVNUM_PROP_KEY, 1);
+	if (c->use_feedback)
+		c->feedback_devnum =
+			property_get_int32(FEEDBACK_DEVNUM_PROP_KEY, 3);
+	c->pdm_chnum = property_get_int32(PDM_CHNUM_PROP_KEY, 4);
+	c->pdm_gain = property_get_int32(PDM_GAIN_PROP_KEY, 0);
+	c->ref_resample_out_chnum =
+		property_get_int32(RESAMPLE_OUT_CHNUM_PROP_KEY, 1);
+	c->check_trigger = property_get_bool(CHECK_TRIGGER_PROP_KEY, 0);
+	c->trigger_done_ret_value = property_get_int32(CHECK_TRIGGER_PROP_KEY, 1);
+	c->pass_after_trigger = property_get_bool(PASS_AFTER_TRIGGER_PROP_KEY, 0);
+	c->verbose = property_get_bool(NXVOICE_VERBOSE_PROP_KEY, 0);
+
+	ALOGI("NXVoice Config");
+	ALOGI("use_feedback: %d", c->use_feedback);
+	ALOGI("pdm_devnum: %d", c->pdm_devnum);
+	ALOGI("ref_devnum: %d", c->ref_devnum);
+	ALOGI("feedback_devnum: %d", c->feedback_devnum);
+	ALOGI("pdm_chnum: %d", c->pdm_chnum);
+	ALOGI("pdm_gain: %d", c->pdm_gain);
+	ALOGI("resample_out_chnum: %d", c->ref_resample_out_chnum);
+	ALOGI("check_trigger: %d", c->check_trigger);
+	ALOGI("trigger_done_ret_value: %d", c->trigger_done_ret_value);
+	ALOGI("pass_after_trigger: %d", c->pass_after_trigger);
+	ALOGI("verbose: %d", c->verbose);
+
+	return true;
+}
+
+static void *thread_start_nxvoice(void *arg)
+{
+	struct audio_device *adev = (struct audio_device *)arg;
+	void *handle = adev->nxvoice_handle;
+	struct nx_smartvoice_config *c = &adev->nxvoice_config;
+	int ret;
+
+	ret = nx_voice_start(handle, c);
+	if (ret < 0) {
+		ALOGE("%s: failed to nx_voice_start", __func__);
+		pthread_exit(NULL);
+	}
+
+	ALOGD("nx_voice started\n");
+
+	if (ret == 0) {
+		ALOGD("%s: child returned\n", __func__);
+	} else {
+		ALOGD("%s: parent returned, child pid %d", __func__, ret);
+	}
+
+	pthread_exit(NULL);
 }
 
 static int adev_open(const hw_module_t* module, const char* name,
@@ -1956,6 +2329,26 @@ static int adev_open(const hw_module_t* module, const char* name,
 	 * selection is always applied by select_devices() */
 
 	*device = &adev->device.common;
+
+	adev->use_nxvoice = nx_voice_prop_init(&adev->nxvoice_config);
+	if (adev->use_nxvoice) {
+		adev->nxvoice_handle = nx_voice_create_handle();
+		if (!adev->nxvoice_handle) {
+			ALOGE("%s: failed to nx_voice_create_handle\n",
+			      __func__);
+			return -ENODEV;
+		} else {
+			pthread_t tid_nxvoice;
+
+			pthread_create(&tid_nxvoice, NULL, thread_start_nxvoice,
+				       (void *)adev);
+
+			/* override input callback */
+			adev->device.get_input_buffer_size = adev_nxvoice_get_input_buffer_size;
+			adev->device.open_input_stream = adev_nxvoice_open_input_stream;
+			adev->device.close_input_stream = adev_nxvoice_close_input_stream;
+		}
+	}
 
 	DLOGI("---%s\n", __FUNCTION__);
 

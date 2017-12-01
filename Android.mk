@@ -32,10 +32,14 @@ LOCAL_SHARED_LIBRARIES := \
 	libcutils \
 	libtinyalsa \
 	libaudioutils \
-	libexpat
+	libexpat \
+	libnxvoice \
+	libpvo
 LOCAL_C_INCLUDES += \
 	external/tinyalsa/include \
 	external/expat/lib \
+	device/nexell/library/nx-smartvoice \
+	device/nexell/library/libpowervoice \
 	$(call include-path-for, audio-utils)
 
 include $(BUILD_SHARED_LIBRARY)
