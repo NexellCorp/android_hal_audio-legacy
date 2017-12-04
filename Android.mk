@@ -32,15 +32,20 @@ LOCAL_SHARED_LIBRARIES := \
 	libcutils \
 	libtinyalsa \
 	libaudioutils \
-	libexpat \
+	libexpat
+LOCAL_C_INCLUDES += \
+	external/tinyalsa/include \
+	external/expat/lib \
+	$(call include-path-for, audio-utils)
+ifeq ($(strip $(BOARD_USES_NXVOICE)),true)
+LOCAL_CFLAGS += -DUSES_NXVOICE
+LOCAL_SHARED_LIBRARIES += \
 	libnxvoice \
 	libpvo \
 	libpovosource
 LOCAL_C_INCLUDES += \
-	external/tinyalsa/include \
-	external/expat/lib \
 	device/nexell/library/nx-smartvoice \
-	device/nexell/library/libpowervoice \
-	$(call include-path-for, audio-utils)
+	device/nexell/library/libpowervoice
+endif
 
 include $(BUILD_SHARED_LIBRARY)

@@ -35,8 +35,10 @@
 
 #include <audio_utils/resampler.h>
 #include <tinyalsa/asoundlib.h>
+#ifdef USES_NXVOICE
 #include <nx-smartvoice.h>
 #include <pvpre.h>
+#endif
 #include "audio_route.h"
 
 #if	(0)
@@ -67,6 +69,7 @@
 
 #define NXAUDIO_INPUT_BUFFER_SIZE		(256 * 1 * 2 * 4)
 
+#ifdef USES_NXVOICE
 static const char *USE_NXVOICE_PROP_KEY = "persist.nv.use_nxvoice";
 static const char *VOICE_VENDOR_PROP_KEY = "persist.nv.voice_vendor";
 static const char *USE_FEEDBACK_PROP_KEY = "persist.nv.use_feedback";
@@ -80,6 +83,7 @@ static const char *CHECK_TRIGGER_PROP_KEY = "persist.nv.check_trigger";
 static const char *TRIGGER_DONE_RET_VALUE_PROP_KEY = "persist.nv.trigger_done_ret";
 static const char *PASS_AFTER_TRIGGER_PROP_KEY = "persist.nv.pass_after_trigger";
 static const char *NXVOICE_VERBOSE_PROP_KEY = "persist.nv.nxvoice_verbose";
+#endif
 
 enum output_type {
 	OUTPUT_DEEP_BUF,      // deep PCM buffers output stream
@@ -153,9 +157,11 @@ struct audio_device {
 	audio_channel_mask_t in_channel_mask;
 	struct stream_out *outputs[OUTPUT_TOTAL];
 
+#ifdef USES_NXVOICE
 	bool use_nxvoice;
 	struct nx_smartvoice_config nxvoice_config;
 	void *nxvoice_handle;
+#endif
 };
 
 struct stream_out {
@@ -212,6 +218,7 @@ struct stream_in {
 	struct snd_card_dev *card;
 };
 
+#ifdef USES_NXVOICE
 struct nxvoice_stream_in {
 	struct audio_stream_in stream;
 	struct audio_device *dev;
@@ -223,6 +230,7 @@ struct nxvoice_stream_in {
 	audio_format_t format;
 	audio_channel_mask_t channel_mask;
 };
+#endif
 
 static int stream_in_refcount = 0; //  add refcount for CTS testRecordingAudioInRawFormats
 
@@ -1935,6 +1943,7 @@ static void adev_close_input_stream(struct audio_hw_device *dev __unused,
 	return;
 }
 
+#ifdef USES_NXVOICE
 /**
  * nxvoice input stream callback implementation */
 static uint32_t nxvoice_in_get_sample_rate(const struct audio_stream *stream)
@@ -2180,6 +2189,7 @@ adev_nxvoice_get_input_buffer_size(const struct audio_hw_device *dev __unused,
 	DLOGI("%s (buffer_size=%d)\n", __func__, buffer_size);
 	return buffer_size;
 }
+#endif
 
 static int adev_dump(const audio_hw_device_t *device __unused,
 					 int fd __unused)
@@ -2193,16 +2203,19 @@ static int adev_close(hw_device_t *device)
 
 	audio_route_free(adev->ar);
 
+#ifdef USES_NXVOICE
 	if (adev->use_nxvoice) {
 		nx_voice_stop(adev->nxvoice_handle);
 		nx_voice_close_handle(adev->nxvoice_handle);
 		adev->nxvoice_handle = NULL;
 	}
+#endif
 
 	free(device);
 	return 0;
 }
 
+#ifdef USES_NXVOICE
 static bool nx_voice_prop_init(struct nx_smartvoice_config *c)
 {
 	int len;
@@ -2288,6 +2301,7 @@ static void *thread_start_nxvoice(void *arg)
 
 	pthread_exit(NULL);
 }
+#endif
 
 static int adev_open(const hw_module_t* module, const char* name,
 					 hw_device_t** device)
@@ -2330,6 +2344,7 @@ static int adev_open(const hw_module_t* module, const char* name,
 
 	*device = &adev->device.common;
 
+#ifdef USES_NXVOICE
 	adev->use_nxvoice = nx_voice_prop_init(&adev->nxvoice_config);
 	if (adev->use_nxvoice) {
 		adev->nxvoice_handle = nx_voice_create_handle();
@@ -2349,6 +2364,7 @@ static int adev_open(const hw_module_t* module, const char* name,
 			adev->device.close_input_stream = adev_nxvoice_close_input_stream;
 		}
 	}
+#endif
 
 	DLOGI("---%s\n", __FUNCTION__);
 
