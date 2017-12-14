@@ -18,6 +18,8 @@
 #
 # The format of the name is audio.<type>.<hardware/etc>.so where the only
 
+ifneq ($(strip $(BOARD_USES_AUDIO_N)),true)
+
 LOCAL_PATH := $(call my-dir)
 
 include $(CLEAR_VARS)
@@ -49,3 +51,5 @@ LOCAL_C_INCLUDES += \
 endif
 
 include $(BUILD_SHARED_LIBRARY)
+
+endif
