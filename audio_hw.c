@@ -37,7 +37,7 @@
 #include <tinyalsa/asoundlib.h>
 #ifdef USES_NXVOICE
 #include <nx-smartvoice.h>
-#include <pvpre.h>
+#include <pvo_wrapper.h>
 #endif
 #include "audio_route.h"
 
